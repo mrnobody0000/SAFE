@@ -13,7 +13,7 @@ def qr(a,b,c,d):
  c=(c+d)&0xffffffff;b^=c;b=rotl(b,7)
  return a,b,c,d
 def chacha_block(k,n,c=0):
- s=[0x61707865,0x3320646e,0x79622d32,0x6b206574]+list(struct.unpack("<8I",k))+[c]+list(struct.unpack("<3I",n+b"\0"))
+ s=[0x61707865,0x3320646e,0x79622d32,0x6b206574]+list(struct.unpack("<8I",k))+[c]+list(struct.unpack("<3I",n))
  w=list(s)
  for _ in range(10):
   w[0],w[4],w[8],w[12]=qr(*w[0::4])
@@ -58,65 +58,69 @@ def genpw(l=20):
  return "".join(choice(a)for _ in range(l))
 
 def create():
- if V.exists():print("exists");return
+ if V.exists():print("Vault already exists");return
  p=getpass("Master: ");c=getpass("Confirm: ")
- if p!=c:print("no");return
+ if p!=c:print("Passwords don't match");return
  s=token_bytes(16);k=dk(p,s)
- v={"meta":{"v":1,"c":now(),"kdf":"scrypt"},"e":[]}
+ v={"meta":{"v":1,"created":now(),"kdf":"scrypt"},"e":[]}
  V.write_bytes(s+encrypt(k,json.dumps(v).encode()))
  print("Vault created → vault.kap")
 
 def load():
- if not V.exists():print("none");return None,None
+ if not V.exists():print("No vault");return None,None
  d=V.read_bytes();s=d[:16];c=d[16:]
  for _ in range(3):
   p=getpass("Master: ");k=dk(p,s)
   try:return json.loads(decrypt(k,c).decode()),k
-  except:print("wrong")
- print("too many fails");return None,None
+  except:print("Wrong password")
+ print("Too many failed attempts");return None,None
 
 def save(v,k):
- c={"meta":v["meta"],"e":[]}
+ clean={"meta":v["meta"],"e":[]}
  for e in v["e"]:
   x=e.copy()
   if"password_plain"in x:x["p"]=encrypt(k,x.pop("password_plain").encode()).hex()
   if"notes_plain"in x:x["n"]=encrypt(k,x.pop("notes_plain").encode()).hex()
-  c["e"].append(x)
- V.write_bytes(token_bytes(16)+encrypt(k,json.dumps(c).encode()))
+  clean["e"].append(x)
+ V.write_bytes(token_bytes(16)+encrypt(k,json.dumps(clean).encode()))
  ts=datetime.now().strftime("%Y%m%d-%H%M%S")
- B.mkdir(exist_ok=True);(B/f"vault_{ts}.kap").write_bytes(V.read_bytes())
- print("saved")
+ (B/f"vault_{ts}.kap").write_bytes(V.read_bytes())
+ print("Saved + backup created")
 
 def new():
- t=input("Title: ");u=input("User: ")or None
- g=input("Gen pw? y/n: ").lower()!="n"
- p=genpw(22)if g else getpass("Pw: ")
- if g:print("Generated:",p)
- n=input("Notes: ");tg=[x.strip()for x in input("Tags (,): ").split(",")if x.strip()]
+ t=input("Title: ");u=input("User (optional): ")or None
+ g=input("Generate strong pw? y/n: ").lower()!="n"
+ p=genpw(22)if g else getpass("Password: ")
+ if g:print("Generated →",p)
+ n=input("Notes (optional): ")
+ tg=[x.strip()for x in input("Tags (comma sep): ").split(",")if x.strip()]
  return{"id":str(uuid.uuid4())[:8],"t":t,"u":u,"password_plain":p,"notes_plain":n,"tags":tg,"c":now(),"m":now()}
 
 def view(e,k):
  p=e.get("password_plain")or(decrypt(k,bytes.fromhex(e.get("p",""))).decode()if"p"in e else"")
- print(f"Title: {e['t']}\nUser: {e.get('u','')}\nPw: {p}\nNotes: {e.get('notes_plain','')}")
- if input("Copy pw? y: ")=="y":cp(p)
+ print(f"\nTitle: {e['t']}\nUser: {e.get('u','')}\nPassword: {p}\nNotes: {e.get('notes_plain','')}\nTags: {', '.join(e.get('tags',[]))}")
+ if input("\nCopy password? y/n: ").lower()=="y":cp(p)
 
 v,k=None,None
-print("KAPTANOVI iSH ZERO-DEP v1.1 – FIXED & READY")
+print("KAPTANOVI iSH ZERO-DEP — FINAL FIXED VERSION — NOV 17 2025")
 while 1:
  print("\n=== KAPTANOVI ===")
  if not V.exists():
-  if input("Create vault? y: ")=="y":create()
+  if input("Create new vault? y/n: ").lower()=="y":create()
   else:sys.exit()
- if v is None:print("1) Unlock")
+ if v is None:print("1) Unlock vault")
  else:print(f"Entries: {len(v['e'])}")
- print("2) New vault  3) Quit")
- c=input("> ")
+ print("2) New vault   3) Quit")
+ c=input("> ").strip()
  if c=="2":
-  if input("OVERWRITE? yes/NO: ")=="yes":V.unlink(missing_ok=True);create()
+  if input("OVERWRITE current vault? yes/NO: ").lower()=="yes":
+   V.unlink(missing_ok=True);create()
  if c=="3":sys.exit()
- if c=="1"and v is None:v,k=load();if not v: continue
+ if c=="1" and v is None:
+  v,k=load()
+  if not v:continue
  if v and k:
-  print("a=add l=list s=search v=view c=change d=del x=lock q=quit")
+  print("a=add l=list s=search v=view c=change d=delete x=lock q=quit")
   cmd=input("> ").lower()
   if cmd=="a":v["e"].append(new())
   elif cmd=="l":[print(f"[{x['id']}] {x['t']}")for x in v["e"]]
@@ -128,12 +132,13 @@ while 1:
    if e:view(e,k)
   elif cmd=="c":
    i=input("ID: ");e=next((x for x in v["e"]if x["id"]==i),None)
-   if e:e["m"]=now();e["password_plain"]=genpw(22)if input("Gen new? y/n: ").lower()!="n"else getpass("New pw: ");print("changed")
+   if e:e["m"]=now();e["password_plain"]=genpw(22)if input("Generate new? y/n: ").lower()!="n"else getpass("New pw: ");print("Password changed")
   elif cmd=="d":
-   i=input("Del ID: ");v["e"]=[x for x in v["e"]if x["id"]!=i];print("deleted")
+   i=input("Delete ID: ");v["e"]=[x for x in v["e"]if x["id"]!=i];print("Deleted")
   elif cmd=="x":
-   if input("Save? y/n: ").lower()!="n":save(v,k)
-   v,k=None,None;print("locked")
+   if input("Save before lock? y/n: ").lower()!="n":save(v,k)
+   v,k=None,None;print("Locked")
   elif cmd=="q":
-   if input("Save? y/n: ").lower()!="n":save(v,k)
-   sys.exit()
+   if input("Save before quit? y/n: ").lower()!="n":save(v,k)
+   print("Bye, Kaiboy.");sys.exit()
+   
