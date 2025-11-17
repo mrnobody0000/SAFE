@@ -141,7 +141,7 @@ while True:
    i=input("ID: ");e=next((e for e in vault["entries"]if e["id"]==i),None)
    if e:view(e,key)
   elif cmd=="c":
-   i=input("ID: ");e=next((e for e in vault["entries"]if e["id"]==i),ente None)
+   i=input("ID: ");e=next((e for e in vault["entries"]if e["id"]==i),None)
    if e:e["m"]=now();e["password_plain"]=genpw()if input("Gen new? y/n: ").lower()!="n"else getpass("New pw: ");print("Changed")
   elif cmd=="d":
    i=input("Del ID: ");vault["entries"]=[e for e in vault["entries"]if e["id"]!=i];print("Deleted")
@@ -151,4 +151,3 @@ while True:
   elif cmd=="q":
    if input("Save? y/n: ").lower()!="n":save(vault,key)
    print("Bye Kaiboy");sys.exit()
-
