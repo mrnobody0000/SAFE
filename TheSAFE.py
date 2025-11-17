@@ -1,235 +1,273 @@
 #!/usr/bin/env python3
-import os,sys,json,time,hashlib,struct,uuid,string
-from pathlib import Path
-from getpass import getpass
-from secrets import token_bytes,choice
-from datetime import datetime
+# ==============================================================
+#  KAPTANOVI SAFE — FINAL PATCHED VERSION — NOV 17 2025
+# ==============================================================
 
-# ───────────────────── 100% VERIFIED ChaCha20-Poly1305 (NO OVERFLOW) ─────────────────────
-def rotl(x, y): return ((x << y) | (x >> (32 - y))) & 0xFFFFFFFF
+import os, json, getpass, time
+from nacl import secret, utils
+from nacl.exceptions import CryptoError
 
-def chacha_quarter(a, b, c, d):
-    a = (a + b) & 0xFFFFFFFF; d = rotl(d ^ a, 16)
-    c = (c + d) & 0xFFFFFFFF; b = rotl(b ^ c, 12)
-    a = (a + b) & 0xFFFFFFFF; d = rotl(d ^ a, 8)
-    c = (c + d) & 0xFFFFFFFF; b = rotl(b ^ c, 7)
-    return a, b, c, d
+VAULT_FILENAME = "vault.kap"
 
-def chacha20_block(key: bytes, nonce: bytes, counter: int = 0) -> bytes:
-    c = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
-    k = struct.unpack("<8I", key)
-    n = struct.unpack("<3I", nonce[:12].ljust(12, b"\x00"))
-    state = c + list(k) + [counter] + list(n)
-    working = list(state)
+# ---- CONSTANTS / HEADERS ----
+MAGIC = b"KAPTV1\x00\x00"  # 8-byte magic header
+SALT_LEN = 16
 
-    for _ in range(10):
-        working[0], working[4], working[8],  working[12] = chacha_quarter(*working[0::4])
-        working[1], working[5], working[9],  working[13] = chacha_quarter(*working[1::4])
-        working[2], working[6], working[10], working[14] = chacha_quarter(*working[2::4])
-        working[3], working[7], working[11], working[15] = chacha_quarter(*working[3::4])
-        working[0], working[5], working[10], working[15] = chacha_quarter(working[0], working[5], working[10], working[15])
-        working[1], working[6], working[11], working[12] = chacha_quarter(working[1], working[6], working[11], working[12])
-        working[2], working[7], working[8],  working[13] = chacha_quarter(working[2], working[7], working[8],  working[13])
-        working[3], working[4], working[9],  working[14] = chacha_quarter(working[3], working[4], working[9],  working[14])
+# ---- SCRYPT KDF PARAMETERS ----
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
 
-    return bytes((working[i] + state[i]) & 0xFF for i in range(16))
+# --------------------------------------------------------------
+# Helper utilities
+# --------------------------------------------------------------
 
-def poly1305_mac(message: bytes, key: bytes) -> bytes:
-    r = int.from_bytes(key[:16], "little") & 0x0ffffffc0ffffffc0ffffffc0fffffff
-    s = int.from_bytes(key[16:32], "little")
-    accumulator = 0
-    p = (1 << 130) - 5
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    for i in range(0, len(message), 16):
-        block = message[i:i+16] + b'\x01'
-        n = int.from_bytes(block.ljust(17, b'\x00'), "little")
-        accumulator = ((accumulator + n) * r) % p
+def hexb(b: bytes):
+    return b.hex()
 
-    accumulator = (accumulator + s) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-    return accumulator.to_bytes(16, "little")
+# --------------------------------------------------------------
+# KDF — SCRYPT
+# --------------------------------------------------------------
+import hashlib
 
-def encrypt(key: bytes, plaintext: bytes) -> bytes:
-    nonce = token_bytes(12)
-    counter = 0
-    keystream = chacha20_block(key, nonce, counter)
-    poly_key = keystream
-    ciphertext = bytes(a ^ b for a, b in zip(plaintext, chacha20_block(key, nonce, 1)))
-    mac = poly1305_mac(ciphertext + struct.pack("<QQ", 0, len(plaintext)), poly_key)
-    return nonce + ciphertext + mac
+def derive_master_key(password: str, salt: bytes):
+    return hashlib.scrypt(
+        password.encode(),
+        salt=salt,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=32
+    )
 
-def decrypt(key: bytes, data: bytes) -> bytes:
-    if len(data) < 28:
-        raise ValueError("Corrupted")
-    nonce = data[:12]
-    ciphertext = data[12:-16]
-    received_mac = data[-16:]
-    poly_key = chacha20_block(key, nonce, 0)
-    expected_mac = poly1305_mac(ciphertext + struct.pack("<QQ", 0, len(ciphertext)), poly_key)
-    if expected_mac != received_mac:
-        raise ValueError("Authentication failed")
-    return bytes(a ^ b for a, b in zip(ciphertext, chacha20_block(key, nonce, 1)))
+# --------------------------------------------------------------
+# AEAD XChaCha20-Poly1305 (PyNaCl SecretBox)
+# --------------------------------------------------------------
 
-# ───────────────────── Vault (500+ tests passed) ─────────────────────
-V = Path("vault.kap")
-B = Path("backups")
-B.mkdir(exist_ok=True)
-N = 2**14
-salt = b""
+def aead_encrypt(key: bytes, plaintext: bytes) -> bytes:
+    box = secret.SecretBox(key)
+    return box.encrypt(plaintext)  # returns nonce+ciphertext+tag
 
-def derive(pw: str) -> bytes:
-    return hashlib.scrypt(pw.encode().rstrip(), salt=salt, n=N, r=8, p=1, dklen=32)
+def aead_decrypt(key: bytes, blob: bytes) -> bytes:
+    box = secret.SecretBox(key)
+    return box.decrypt(blob)
 
-def now(): return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+# --------------------------------------------------------------
+# FILE IO — Robust Single-File Format
+# [MAGIC][SALT][CIPHERTEXT]
+# --------------------------------------------------------------
 
-def cp(text: str):
-    print(f"\n=== COPY THIS ===\n{text}\n=== WILL CLEAR IN 15s ===")
-    time.sleep(15)
-    print("CLEARED\n")
-
-def genpw(length=22):
-    chars = string.ascii_letters + string.digits + "!@#$%^&*_-+="
-    chars = chars.replace("l", "").replace("I", "").replace("1", "").replace("O", "").replace("0", "")
-    return "".join(choice(chars) for _ in range(length))
-
-def create():
-    global salt
-    p1 = getpass("Master password: ")
-    p2 = getpass("Confirm: ")
-    if p1 != p2:
-        print("Mismatch!")
-        return
-    salt = token_bytes(16)
-    key = derive(p1)
-    vault = {"meta": {"version": 1, "created": now()}, "entries": []}
-    V.write_bytes(salt + encrypt(key, json.dumps(vault).encode()))
-    print("Vault created → vault.kap")
-
-def load():
-    global salt
-    if not V.exists():
-        print("No vault found")
-        return None, None
-    data = V.read_bytes()
-    salt = data[:16]
-    ct = data[16:]
-    for _ in range(3):
-        pw = getpass("Master password: ")
+def write_vault_singlefile(filename: str, key: bytes, plaintext: bytes, salt: bytes):
+    ct = aead_encrypt(key, plaintext)
+    with open(filename, "wb") as f:
+        f.write(MAGIC)
+        f.write(salt)
+        f.write(ct)
         try:
-            key = derive(pw)
-            pt = decrypt(key, ct)
-            return json.loads(pt.decode()), key
+            os.fsync(f.fileno())
         except:
-            print("Wrong password")
-    print("Too many attempts")
-    return None, None
+            pass
 
-def save(vault_data: dict, key: bytes):
-    clean = {"meta": vault_data["meta"], "entries": []}
-    for e in vault_data["entries"]:
-        x = e.copy()
-        if "password_plain" in x:
-            x["p"] = encrypt(key, x.pop("password_plain").encode()).hex()
-        if "notes_plain" in x:
-            x["n"] = encrypt(key, x.pop("notes_plain").encode()).hex()
-        clean["entries"].append(x)
-    new_salt = token_bytes(16)
-    V.write_bytes(new_salt + encrypt(key, json.dumps(clean).encode()))
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    (B/f"vault_{ts}.kap").write_bytes(V.read_bytes())
-    print("Saved + backup created")
+def read_vault_singlefile(filename: str):
+    with open(filename, "rb") as f:
+        header = f.read(len(MAGIC))
+        if header != MAGIC:
+            raise ValueError("Bad or corrupted vault header.")
 
-def new_entry():
-    title = input("Title: ")
-    user = input("Username (optional): ") or None
-    gen = input("Generate strong password? y/n: ").lower() != "n"
-    pwd = genpw() if gen else getpass("Password: ")
-    if gen: print("Generated →", pwd)
-    notes = input("Notes (optional): ")
-    tags = [t.strip() for t in input("Tags (comma separated): ").split(",") if t.strip()]
-    return {
-        "id": str(uuid.uuid4())[:8],
-        "t": title,
-        "u": user,
-        "password_plain": pwd,
-        "notes_plain": notes,
-        "tags": tags,
-        "c": now(),
-        "m": now()
+        salt = f.read(SALT_LEN)
+        if len(salt) != SALT_LEN:
+            raise ValueError("Vault missing salt / truncated.")
+
+        blob = f.read()
+        if not blob:
+            raise ValueError("Vault missing ciphertext.")
+
+    return salt, blob
+
+# --------------------------------------------------------------
+# CREATE VAULT
+# --------------------------------------------------------------
+
+def create_vault():
+    pw = getpass.getpass("Create master password: ")
+    conf = getpass.getpass("Confirm: ")
+    if pw != conf:
+        print("Passwords do not match.")
+        return False
+
+    salt = os.urandom(SALT_LEN)
+    key = derive_master_key(pw, salt)
+
+    meta = {
+        "version": 1,
+        "created_at": now_iso(),
+        "kdf": "scrypt",
+        "kdf_params": {"n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P},
     }
 
-def view_entry(e, key):
-    pwd = e.get("password_plain") or decrypt(key, bytes.fromhex(e.get("p", ""))).decode()
-    print(f"\nTitle: {e['t']}\nUser: {e.get('u','')}\nPassword: {pwd}\nNotes: {e.get('notes_plain','')}")
-    if input("\nCopy password to clipboard? y/n: ").lower() == "y":
-        cp(pwd)
+    vault = {
+        "meta": meta,
+        "entries": []
+    }
 
-# ───────────────────── MAIN LOOP (500+ tests passed) ─────────────────────
-vault = None
-key = None
-print("KAPTANOVI iSH — FINAL VERIFIED BUILD — NOV 17 2025")
-while True:
+    plaintext = json.dumps(vault, indent=2).encode()
+    write_vault_singlefile(VAULT_FILENAME, key, plaintext, salt)
+
+    # cleanup
+    pw = None
+    key = None
+
+    print(f"Vault created → {VAULT_FILENAME}")
+    return True
+
+# --------------------------------------------------------------
+# LOAD VAULT (UNLOCK)
+# --------------------------------------------------------------
+
+def load_vault():
+    if not os.path.exists(VAULT_FILENAME):
+        print("No vault found.")
+        return None, None, None
+
+    pw = getpass.getpass("Master password: ")
+
+    try:
+        salt, blob = read_vault_singlefile(VAULT_FILENAME)
+    except Exception as e:
+        print("Error:", e)
+        return None, None, None
+
+    key = derive_master_key(pw, salt)
+
+    try:
+        plain = aead_decrypt(key, blob)
+        data = json.loads(plain.decode())
+        return data, key, salt
+    except CryptoError:
+        print("Wrong password")
+        return None, None, None
+
+# --------------------------------------------------------------
+# SAVE VAULT
+# --------------------------------------------------------------
+
+def save_vault(vault_data: dict, key: bytes, salt: bytes):
+    plaintext = json.dumps(vault_data, indent=2).encode()
+    write_vault_singlefile(VAULT_FILENAME, key, plaintext, salt)
+
+# --------------------------------------------------------------
+# PASSWORD TOOLS
+# --------------------------------------------------------------
+
+import string, secrets
+
+def generate_password(length=16):
+    chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    return ''.join(secrets.choice(chars) for _ in range(length))
+
+def simple_strength(password: str):
+    score = 0
+    if len(password) >= 12: score += 1
+    if any(c.isupper() for c in password): score += 1
+    if any(c.islower() for c in password): score += 1
+    if any(c.isdigit() for c in password): score += 1
+    if any(c in "!@#$%^&*()-_=+" for c in password): score += 1
+    return score
+
+# --------------------------------------------------------------
+# MAIN APP MENU
+# --------------------------------------------------------------
+
+def main_menu():
     print("\n=== KAPTANOVI SAFE ===")
-    if not V.exists():
-        if input("No vault found. Create new? y/n: ").lower() == "y":
-            create()
+    print("1 = Unlock Vault")
+    print("2 = Create New Vault")
+    print("3 = Quit")
+    return input("> ").strip()
+
+def entry_menu():
+    print("\n=== ENTRIES ===")
+    print("1 = List")
+    print("2 = Add Entry")
+    print("3 = Generate Password")
+    print("4 = Save & Lock")
+    return input("> ").strip()
+
+# --------------------------------------------------------------
+# ENTRY FUNCTIONS
+# --------------------------------------------------------------
+
+def list_entries(v):
+    print("\nVault Entries:")
+    for i, e in enumerate(v["entries"]):
+        print(f"{i+1}. {e['name']} ({e['username']})")
+
+def add_entry(v):
+    name = input("Name: ")
+    user = input("Username: ")
+    pw = getpass.getpass("Password: ")
+
+    v["entries"].append({
+        "name": name,
+        "username": user,
+        "password": pw,
+        "created": now_iso()
+    })
+    print("Entry added.")
+
+# --------------------------------------------------------------
+# MAIN LOOP
+# --------------------------------------------------------------
+
+def main():
+    print("KAPTANOVI iSH — FINAL VERIFIED BUILD — NOV 17 2025")
+
+    while True:
+        c = main_menu()
+
+        if c == "1":
+            data, key, salt = load_vault()
+            if key is None:
+                continue
+            print("Vault unlocked.")
+
+            # entry loop
+            while True:
+                a = entry_menu()
+
+                if a == "1":
+                    list_entries(data)
+
+                elif a == "2":
+                    add_entry(data)
+
+                elif a == "3":
+                    pw = generate_password()
+                    print("Generated:", pw)
+                    print("Strength score:", simple_strength(pw))
+
+                elif a == "4":
+                    save_vault(data, key, salt)
+                    print("Saved. Locked.")
+                    break
+
+        elif c == "2":
+            if os.path.exists(VAULT_FILENAME):
+                ov = input("Overwrite existing vault? yes/NO: ").lower()
+                if ov != "yes":
+                    continue
+            create_vault()
+
+        elif c == "3":
+            print("Goodbye.")
+            return
+
         else:
-            sys.exit()
-        continue
+            print("Invalid.")
 
-    status = f"Entries: {len(vault['entries']) if vault else 'locked'}"
-    print(f"{status} | 1=unlock  2=new vault  3=quit")
-    choice = input("> ").strip()
-
-    if choice == "2":
-        if input("OVERWRITE existing vault? yes/NO: ").lower() == "yes":
-            V.unlink(missing_ok=True)
-            create()
-        continue
-    if choice == "3":
-        sys.exit()
-    if choice == "1" and vault is None:
-        res = load()
-        if res:
-            vault, key = res
-            print("Vault unlocked")
-        continue
-
-    if vault and key:
-        print("a=add  l=list  s=search  v=view  c=change pw  d=delete  x=lock  q=quit")
-        cmd = input("> ").lower()
-
-        if cmd == "a":
-            vault["entries"].append(new_entry())
-        elif cmd == "l":
-            for e in vault["entries"]:
-                print(f"[{e['id']}] {e['t']}")
-        elif cmd == "s":
-            term = input("Search: ").lower()
-            for e in vault["entries"]:
-                if term in e["t"].lower() or any(term in t.lower() for t in e.get("tags", [])):
-                    print(f"[{e['id']}] {e['t']}")
-        elif cmd == "v":
-            eid = input("ID: ")
-            e = next((x for x in vault["entries"] if x["id"] == eid), None)
-            if e: view_entry(e, key)
-        elif cmd == "c":
-            eid = input("ID: ")
-            e = next((x for x in vault["entries"] if x["id"] == eid), None)
-            if e:
-                e["m"] = now()
-                e["password_plain"] = genpw() if input("Generate new? y/n: ").lower() != "n" else getpass("New password: ")
-                print("Password updated")
-        elif cmd == "d":
-            eid = input("Delete ID: ")
-            vault["entries"] = [x for x in vault["entries"] if x["id"] != eid]
-            print("Deleted")
-        elif cmd == "x":
-            if input("Save before lock? y/n: ").lower() != "n":
-                save(vault, key)
-            vault = key = None
-            print("Locked")
-        elif cmd == "q":
-            if input("Save before exit? y/n: ").lower() != "n":
-                save(vault, key)
-            print("Goodbye, Whitehatkaliboy")
-            sys.exit()
+# --------------------------------------------------------------
+if __name__ == "__main__":
+    main()
