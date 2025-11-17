@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""
-KAPTANOVI PASSWORD SAFE – iSH ZERO-DEP FINAL EDITION
-Works on ANY fresh iSH install. 100 % pure stdlib.
-scrypt + ChaCha20-Poly1305 (pure-Python, correct, fast enough)
-Copy-paste this whole block → hit Enter → you're in.
-"""
-
 import os,sys,json,time,hashlib,hmac,struct,uuid,string
 from pathlib import Path
 from getpass import getpass
 from secrets import token_bytes,choice
 from datetime import datetime
 
-# ───────────────────── Pure ChaCha20-Poly1305 ─────────────────────
 def rotl(a,b):return((a<<b)&0xffffffff)|(a>>(32-b))
 def qr(a,b,c,d):
  a=(a+b)&0xffffffff;d^=a;d=rotl(d,16)
@@ -51,13 +43,11 @@ def decrypt(key,data):
  if len(data)<28:raise ValueError("bad")
  nonce,ct,tag=data[:12],data[12:-16],data[-16:]
  polykey=chacha_block(key,nonce)
- if poly1305(ct+struct.pack("<QQ",0,len(ct)),polykey)!=tag:
-  raise ValueError("fail")
+ if poly1305(ct+struct.pack("<QQ",0,len(ct)),polykey)!=tag:raise ValueError("fail")
  return bytes(a^b for a,b in zip(ct,chacha_block(key,nonce,1)))
 
-# ───────────────────── Vault ─────────────────────
 V=Path("vault.kap");B=Path("backups");B.mkdir(exist_ok=True)
-N=2**14 # ~60ms on iSH
+N=2**14
 
 def dk(p,s):return hashlib.scrypt(p.encode(),salt=s,n=N,r=8,p=1,dklen=32)
 def now():return datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
@@ -69,7 +59,8 @@ def genpw(l=20):
 
 def create():
  if V.exists():print("exists");return
- p=getpass("Master: ");c=getpass("Confirm: ");if p!=c:print("no");return
+ p=getpass("Master: ");c=getpass("Confirm: ")
+ if p!=c:print("no");return
  s=token_bytes(16);k=dk(p,s)
  v={"meta":{"v":1,"c":now(),"kdf":"scrypt"},"e":[]}
  V.write_bytes(s+encrypt(k,json.dumps(v).encode()))
@@ -82,7 +73,7 @@ def load():
   p=getpass("Master: ");k=dk(p,s)
   try:return json.loads(decrypt(k,c).decode()),k
   except:print("wrong")
- return None,None
+ print("too many fails");return None,None
 
 def save(v,k):
  c={"meta":v["meta"],"e":[]}
@@ -92,7 +83,7 @@ def save(v,k):
   if"notes_plain"in x:x["n"]=encrypt(k,x.pop("notes_plain").encode()).hex()
   c["e"].append(x)
  V.write_bytes(token_bytes(16)+encrypt(k,json.dumps(c).encode()))
- ts=datetime.now().strftime("%Y%m%d-%H%M%S.py")
+ ts=datetime.now().strftime("%Y%m%d-%H%M%S")
  B.mkdir(exist_ok=True);(B/f"vault_{ts}.kap").write_bytes(V.read_bytes())
  print("saved")
 
@@ -110,7 +101,7 @@ def view(e,k):
  if input("Copy pw? y: ")=="y":cp(p)
 
 v,k=None,None
-print("KAPTANOVI iSH ZERO-DEP READY")
+print("KAPTANOVI iSH ZERO-DEP v1.1 – FIXED & READY")
 while 1:
  print("\n=== KAPTANOVI ===")
  if not V.exists():
@@ -123,7 +114,7 @@ while 1:
  if c=="2":
   if input("OVERWRITE? yes/NO: ")=="yes":V.unlink(missing_ok=True);create()
  if c=="3":sys.exit()
- if c=="1"and v is None:v,k=load();continue
+ if c=="1"and v is None:v,k=load();if not v:continue
  if v and k:
   print("a=add l=list s=search v=view c=change d=del x=lock q=quit")
   cmd=input("> ").lower()
@@ -137,10 +128,7 @@ while 1:
    if e:view(e,k)
   elif cmd=="c":
    i=input("ID: ");e=next((x for x in v["e"]if x["id"]==i),None)
-   if e:
-    e["m"]=now()
-    e["password_plain"]=genpw(22)if input("Gen new? y/n: ").lower()!="n"else getpass("New pw: ")
-    print("changed")
+   if e:e["m"]=now();e["password_plain"]=genpw(22)if input("Gen new? y/n: ").lower()!="n"else getpass("New pw: ");print("changed")
   elif cmd=="d":
    i=input("Del ID: ");v["e"]=[x for x in v["e"]if x["id"]!=i];print("deleted")
   elif cmd=="x":
