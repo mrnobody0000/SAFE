@@ -114,7 +114,7 @@ while 1:
  if c=="2":
   if input("OVERWRITE? yes/NO: ")=="yes":V.unlink(missing_ok=True);create()
  if c=="3":sys.exit()
- if c=="1"and v is None:v,k=load();if not v:continue
+ if c=="1"and v is None:v,k=load();if not v: continue
  if v and k:
   print("a=add l=list s=search v=view c=change d=del x=lock q=quit")
   cmd=input("> ").lower()
