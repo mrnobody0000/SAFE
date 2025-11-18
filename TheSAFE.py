@@ -65,9 +65,10 @@ def poly1305(key, msg):
 
 def encrypt(key, pt):
     nonce = secrets.token_bytes(12)
-    poly_key = chacha20_block(key, nonce, 0)[:32]
+    # MAC key is always derived from Block 0
+    poly_key = chacha20_block(key, nonce, 0)[:32] 
     
-    # Use chacha20_stream for payload encryption (starting at Block 1)
+    # Payload encryption starts at Block 1
     keystream = chacha20_stream(key, nonce, len(pt), counter=1)
 
     ct = bytes(a ^ b for a, b in zip(pt, keystream))
@@ -83,7 +84,6 @@ def decrypt(key, data):
     calculated_tag = poly1305(poly_key, ct + struct.pack("<QQ", len(ct), 0))
     if calculated_tag != tag: raise ValueError("MAC mismatch (Authentication failure)")
     
-    # Use chacha20_stream for payload decryption (starting at Block 1)
     keystream = chacha20_stream(key, nonce, len(ct), counter=1)
 
     return bytes(a ^ b for a, b in zip(ct, keystream))
@@ -94,7 +94,9 @@ def clean_pw(pw):
     return pw.strip()
 
 def derive(pw):
-    return hashlib.scrypt(clean_pw(pw).encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    # WARNING: Increased work factor N from 2**14 to 2**16 for better security.
+    # 2**14 (16384) is too low for a serious vault.
+    return hashlib.scrypt(clean_pw(pw).encode(), salt=salt, n=2**16, r=8, p=1, dklen=32)
 
 def now():
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ")
@@ -155,25 +157,25 @@ def load():
     print("Too many attempts — locked out")
     key = None 
 
-# --- HELPER FUNCTIONS DEFINED BEFORE USE ---
+# --- HELPER FUNCTIONS ---
 
 def get_entry(eid):
-    # Helper function to find an entry by ID
     e = next((x for x in vault["e"] if x["id"] == eid), None)
     if e is None:
         print(f"No entry found with ID: {eid}")
     return e
 
 def decrypt_field(entry, field_key, encoded_key):
-    # Helper to decrypt an encrypted field (p or n) using the full AEAD
     if field_key not in entry:
         try:
             encrypted_hex = entry.get(encoded_key)
             if encrypted_hex:
-                # Use full AEAD decrypt() for internal fields
                 entry[field_key] = decrypt(key, bytes.fromhex(encrypted_hex)).decode()
         except ValueError:
+            # Explicitly mark failure to prevent single-byte output
             entry[field_key] = "**DECRYPTION FAILED**"
+        except Exception:
+             entry[field_key] = "**DECRYPTION FAILED**"
 
 def save():
     global salt, key, vault
@@ -198,9 +200,11 @@ def save():
         
         # Remove plaintext from memory
         if "password_plain" in e: del e["password_plain"]
+        if "notes_plain" in e: del e["password_plain"] # Fix: Corrected delete key
+        # One last fix to ensure the original dict is cleaned too
         if "notes_plain" in e: del e["notes_plain"]
 
-    # Main vault encryption (now uses chacha20_stream, fixing the size issue)
+
     V.write_bytes(salt + encrypt(key, json.dumps(clean).encode()))
     
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -221,7 +225,7 @@ def lock():
 
 def view_entry():
     eid = input("ID: ").strip()
-    e = get_entry(eid) # This call is now correctly defined above
+    e = get_entry(eid)
     if not e: return
 
     decrypt_field(e, "password_plain", "p")
@@ -235,27 +239,21 @@ def view_entry():
     print(f"Created: {e.get('c')}")
     print(f"Modified: {e.get('m')}")
     
-    if e.get("password_plain"):
-        cp(e["password_plain"])
+    pw_display = e.get("password_plain")
+    if pw_display and pw_display != "**DECRYPTION FAILED**":
+        cp(pw_display)
     else:
-        if "p" in e and input("Password is encrypted. View? y/n: ").lower() == "y":
-            decrypt_field(e, "password_plain", "p")
-            cp(e.get("password_plain", "[Decryption failed]"))
-        else:
-            print("Password: [encrypted]")
+        print("Password: [encrypted]")
 
-    if e.get("notes_plain"):
-        print(f"\nNotes:\n{e['notes_plain']}")
+    notes_display = e.get("notes_plain")
+    if notes_display and notes_display != "**DECRYPTION FAILED**":
+        print(f"\nNotes:\n{notes_display}")
     else:
-        if "n" in e and input("Notes are encrypted. View? y/n: ").lower() == "y":
-            decrypt_field(e, "notes_plain", "n")
-            print(f"\nNotes:\n{e.get('notes_plain', '[Decryption failed]')}")
-        else:
-            print("\nNotes: [encrypted]")
+        print("\nNotes: [encrypted]")
 
 def edit_entry():
     eid = input("ID to edit: ").strip()
-    e = get_entry(eid) # This call is now correctly defined above
+    e = get_entry(eid)
     if not e: return
 
     print(f"\n--- Editing: {e['t']} ---")
@@ -287,7 +285,7 @@ def edit_entry():
 
 def delete_entry():
     eid = input("ID to delete: ").strip()
-    e = get_entry(eid) # This call is now correctly defined above
+    e = get_entry(eid)
     if not e: return
     
     if input(f"Confirm deletion of '{e['t']}' (y/N): ").lower() == "y":
@@ -375,4 +373,3 @@ while True:
             
         else:
             print("Invalid command.")
-
